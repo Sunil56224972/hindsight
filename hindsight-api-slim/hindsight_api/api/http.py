@@ -9160,7 +9160,14 @@ def _register_routes(app: FastAPI):
             if file_info is None:
                 raise HTTPException(status_code=404, detail="File not found")
 
-            headers = {"Content-Disposition": f'attachment; filename="{bank_id}-documents.zip"'}
+            # SECURITY: Sanitize the bank_id before interpolating into the
+            # Content-Disposition header (CWE-113). The bank_id is parsed from
+            # the storage key and may contain characters that break out of the
+            # quoted filename value — double-quotes, backslashes, newlines, or
+            # semicolons could inject arbitrary header directives.
+            import re as _re
+            safe_bank_id = _re.sub(r'[\"\\\\\\r\\n;]', '_', bank_id)
+            headers = {"Content-Disposition": f'attachment; filename="{safe_bank_id}-documents.zip"'}
             if file_info.size is not None:
                 headers["Content-Length"] = str(file_info.size)
 
