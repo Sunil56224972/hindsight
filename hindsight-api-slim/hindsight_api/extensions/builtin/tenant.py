@@ -76,9 +76,7 @@ class ApiKeyTenantExtension(TenantExtension):
         # attacks (CWE-208). Python's != short-circuits on the first differing
         # byte, leaking which prefix of a guess is correct via response-time
         # measurement. hmac.compare_digest compares all bytes regardless.
-        if not context.api_key or not hmac.compare_digest(
-            context.api_key.encode(), self.expected_api_key.encode()
-        ):
+        if not context.api_key or not hmac.compare_digest(context.api_key.encode(), self.expected_api_key.encode()):
             raise AuthenticationError("Invalid API key")
         return TenantContext(schema_name=get_config().database_schema)
 

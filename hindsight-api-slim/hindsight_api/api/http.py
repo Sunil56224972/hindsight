@@ -9166,7 +9166,8 @@ def _register_routes(app: FastAPI):
             # quoted filename value — double-quotes, backslashes, newlines, or
             # semicolons could inject arbitrary header directives.
             import re as _re
-            safe_bank_id = _re.sub(r'[\"\\\\\\r\\n;]', '_', bank_id)
+
+            safe_bank_id = _re.sub(r"[\"\\\\\\r\\n;]", "_", bank_id)
             headers = {"Content-Disposition": f'attachment; filename="{safe_bank_id}-documents.zip"'}
             if file_info.size is not None:
                 headers["Content-Length"] = str(file_info.size)
